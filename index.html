@@ -6,7 +6,6 @@
 <meta content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" name="viewport"/>
 <title>Mono 5.4ver</title>
 
-<link href="style.css" rel="stylesheet"/>
 
 
 <!-- PWA Meta Tags -->
@@ -31,6 +30,7 @@
 <link href="https://fonts.googleapis.com/css2?family=Gowun+Dodum&amp;display=swap" rel="stylesheet"/>
 <link href="https://fonts.googleapis.com/css2?family=Noto+Serif+TC:wght@400;700&amp;family=Montserrat:wght@300;500;700&amp;family=DM+Serif+Display&amp;family=DM+Mono:wght@400;500&amp;display=swap" rel="stylesheet"/>
 <link href="https://fonts.googleapis.com/css2?family=Zen+Maru+Gothic:wght@700&amp;display=swap" rel="stylesheet"/>
+<link href="style.css?v=order-fixed-20260709" rel="stylesheet"/>
 
 
 
@@ -53,6 +53,18 @@
 
 
 
+
+<script id="mono-split-resource-probe">
+(function(){
+  function warn(msg){ try{ console.warn('[Mono split]', msg); }catch(e){} }
+  window.addEventListener('error', function(e){
+    var t=e && e.target;
+    if(!t) return;
+    if(t.tagName==='LINK' && String(t.href||'').indexOf('style.css')>-1) warn('style.css 没有加载：请上传整个文件夹，不要只上传 index.html');
+    if(t.tagName==='SCRIPT' && String(t.src||'').indexOf('script.js')>-1) warn('script.js 没有加载：请上传整个文件夹，不要只上传 index.html');
+  }, true);
+})();
+</script>
 </head>
 <body>
 <div aria-hidden="true" id="monoBootSplash">
@@ -6964,7 +6976,7 @@
 
 <!-- === FINAL PATCH: Offline role-specific data guard / per-character entry fix === -->
 
-<script src="script.js"></script></body>
+<script src="script.js?v=order-fixed-20260709"></script></body>
 
 <!-- MONO FINAL FIX: Sticker library dialogs are not covered; use a real top-layer modal and direct button routing -->
 
