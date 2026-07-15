@@ -21047,6 +21047,12 @@ body:not(.ios-fullscreen).chat-page-active.chat-preset-frosted-active #chatPage.
 #groupChatPage .bubble-user .mono-gc-quote-block{background:rgba(255,255,255,.18);border-left-color:rgba(255,255,255,.55);color:rgba(255,255,255,.82);}
 #groupChatPage .bubble-ai .mono-gc-quote-block{background:rgba(0,0,0,.045);}
 </style>
+
+<style id="mono-chat-crash-deep-fix">
+#chatBox{contain:layout paint style;overflow-anchor:none;}
+#chatBox .msg-row{contain:layout style;}
+html.mono-chat-replying #chatBox{pointer-events:auto;}
+</style>
 </head>
 <body>
 <div id="monoBootSplash" aria-hidden="true">
@@ -48490,18 +48496,27 @@ ${monoOneShotChatInstruction()}${_monoOneShotStickerPack.prompt || ''}${monoBuil
       msg = monoStripChatTimeLabelText(monoCleanApiDatasetLeak(String(msg || '').trim()));
       if (!msg) continue;
       p.history.push({ role: 'assistant', content: msg, timestamp: Date.now() });
-      // Only render if user is still viewing this persona's chat
-      if (currentId == _replyPersonaId) {
-        try { renderMessages({ fast: true }); } catch(e) {}
-      }
-      saveData();
+      // 深度稳定修复：回复逐条写入数据，但不要每条都销毁并重建整个 chatBox。
+      // 原 renderMessages() 使用 box.innerHTML = html，会一次性销毁全部气泡、图片和监听器；
+      // 在移动端连续执行时会造成白屏、页面错位，严重时浏览器直接回收并重新载入页面。
     }
+    // 一轮普通文字全部写入后，只重绘一次聊天室。
+    if (currentId == _replyPersonaId) {
+      try { renderMessages({ fast: true, forceScrollToBottom: true }); } catch(e) { console.warn('[chat render]', e); }
+    }
+    // 保存改为延迟合并：让本轮 DOM 重绘先完成，避免同步 JSON 序列化和 innerHTML 重建撞在同一帧。
+    try {
+      clearTimeout(window.__monoReplySaveTimer);
+      window.__monoReplySaveTimer = setTimeout(function(){
+        try { saveData(); } catch(e) { console.warn('[chat save]', e); }
+      }, 380);
+    } catch(e) { console.warn('[chat save schedule]', e); }
     if (_monoOneShotRichCardsToSend && _monoOneShotRichCardsToSend.length && !_auto回复Cancelled) {
       await new Promise(r => setTimeout(r, 120 + Math.random()*260));
       try {
         if (monoPushOneShotRichCards(p, _monoOneShotRichCardsToSend, p.name || '角色', _effectiveUserName || '你')) {
           if (currentId == _replyPersonaId) { try { renderMessages({ fast: true }); } catch(e) {} }
-          saveData();
+          clearTimeout(window.__monoReplySaveTimer); window.__monoReplySaveTimer = setTimeout(function(){ try { saveData(); } catch(e) {} }, 380);
         }
       } catch(e) { console.warn('[one-shot rich] push failed:', e); }
     }
@@ -48513,7 +48528,7 @@ ${monoOneShotChatInstruction()}${_monoOneShotStickerPack.prompt || ''}${monoBuil
       if (_stickerSrc) {
         p.history.push({ role: 'assistant', msgType: 'sticker', stickerSrc: _stickerSrc, src: _stickerSrc, caption: _caption, content: '[角色发送了表情包: ' + (_caption || '无描述') + ']', timestamp: Date.now() });
         if (currentId == _replyPersonaId) { try { renderMessages({ fast: true }); } catch(e) {} }
-        saveData();
+        clearTimeout(window.__monoReplySaveTimer); window.__monoReplySaveTimer = setTimeout(function(){ try { saveData(); } catch(e) {} }, 380);
       }
     }
     if (_monoOneShotImageToSend && !_auto回复Cancelled) {
@@ -48548,8 +48563,9 @@ ${monoOneShotChatInstruction()}${_monoOneShotStickerPack.prompt || ''}${monoBuil
     setTimeout(function() {
       try { renderContactList(); } catch(e) {}
     }, 0);
-    if (currentId == _replyPersonaId) {
-      try { renderMessages(_replyStabilityMode ? { fast: true } : {}); } catch(e) {}
+    // 普通文字已经在上方统一重绘；这里只在附加卡片/贴纸确实存在时补一次重绘，避免重复销毁 chatBox。
+    if (currentId == _replyPersonaId && ((_monoOneShotRichCardsToSend && _monoOneShotRichCardsToSend.length) || _monoOneShotStickerToSend)) {
+      try { renderMessages({ fast: true, forceScrollToBottom: true }); } catch(e) {}
     }
     // 心声独立 API：在聊天气泡落地后另开请求生成，只更新顶部/弹窗，不写入角色消息。
     if (!_auto回复Cancelled && _isHeartVoiceGenerationEnabled(p) && typeof monoGenerateSeparatedHeartVoice === 'function') {
@@ -135700,43 +135716,311 @@ body.home-edit-active:not(.ins-opening) .home-screen .is-dragging-source .pw-del
 
 <script id="mono-chat-api-guard-bundle">
 (function(){
-  'use strict';
-  if (window.__monoLightChatSubmitGuard) return;
-  window.__monoLightChatSubmitGuard = true;
+  if (window.__monoChatReplyRefreshAfterReplyFinalFix) return;
+  window.__monoChatReplyRefreshAfterReplyFinalFix = true;
 
-  function chatRootFrom(node) {
-    try { return node && node.closest ? node.closest('#chatPage,#groupChatPage,#datingChatPage,#callPage') : null; }
-    catch (e) { return null; }
+  var criticalUntil = 0;
+  var replyDepth = 0;
+  var originalReload = null;
+
+  function now(){ return Date.now ? Date.now() : new Date().getTime(); }
+  function mark(ms){
+    ms = ms || 12000;
+    criticalUntil = Math.max(criticalUntil, now() + ms);
+    try { window.__monoRecentChatActivityAt = now(); } catch(e) {}
+  }
+  function isChatVisible(){
+    try {
+      var p = document.getElementById('chatPage');
+      if (!p) return false;
+      var cs = window.getComputedStyle ? getComputedStyle(p) : null;
+      return p.classList.contains('active') || !p.classList.contains('hidden') || (cs && cs.display !== 'none' && cs.visibility !== 'hidden');
+    } catch(e) { return false; }
+  }
+  function hasReplyLock(){
+    try {
+      if (window._auto回复Locks && typeof window._auto回复Locks === 'object') {
+        return Object.keys(window._auto回复Locks).some(function(k){ return !!window._auto回复Locks[k]; });
+      }
+    } catch(e) {}
+    return false;
+  }
+  function intentionalReloadAllowed(){
+    try { return window.__monoAllowIntentionalReloadUntil && now() < window.__monoAllowIntentionalReloadUntil; } catch(e) { return false; }
+  }
+  function inCriticalReplyWindow(){
+    return !intentionalReloadAllowed() && (replyDepth > 0 || hasReplyLock() || now() < criticalUntil);
+  }
+  window.monoMarkChatReplyNoReload = mark;
+  window.monoAllowNextIntentionalReload = function(ms){ window.__monoAllowIntentionalReloadUntil = now() + (ms || 6000); };
+
+  function wrapGlobalFunction(name){
+    try {
+      var old = window[name];
+      if (typeof old !== 'function' || old.__monoNoRefreshAfterReplyWrapped) return;
+      var wrapped = function(){
+        mark(18000);
+        replyDepth++;
+        var ret;
+        try { ret = old.apply(this, arguments); }
+        catch(err) { replyDepth = Math.max(0, replyDepth - 1); mark(12000); throw err; }
+        if (ret && typeof ret.then === 'function') {
+          return ret.finally(function(){ replyDepth = Math.max(0, replyDepth - 1); mark(15000); });
+        }
+        replyDepth = Math.max(0, replyDepth - 1);
+        mark(15000);
+        return ret;
+      };
+      wrapped.__monoNoRefreshAfterReplyWrapped = true;
+      window[name] = wrapped;
+      try { eval(name + ' = wrapped'); } catch(e) {}
+    } catch(e) {}
   }
 
-  // 只阻止聊天区域内的表单默认提交，不再扫描整页 DOM、包裹 renderMessages/saveData，
-  // 也不再长期拦截 location.reload，避免回复落地时触发 iOS 内存峰值和页面重载。
+  [
+    'sendMessage','triggerAuto回复','triggerAutoReply','generateReply','getAIResponse',
+    '_handleAuto回复AfterSend','_tryAuto回复WhenNotTyping','tryPersonaSendVoice',
+    'maybeGenerateReadHeartVoicePopup','maybeGenerateReadHeartVoicePopup','renderMessages'
+  ].forEach(wrapGlobalFunction);
+
+  // 角色回复落地后，saveData/renderMessages/语音/通知链路有时会触发旧的重载兜底；回复窗口内禁止它刷新整页。
+  try {
+    if (typeof window.saveData === 'function' && !window.saveData.__monoNoRefreshAfterReplyWrapped) {
+      var oldSaveData = window.saveData;
+      var saveWrapped = function(){ if (isChatVisible()) mark(12000); return oldSaveData.apply(this, arguments); };
+      saveWrapped.__monoNoRefreshAfterReplyWrapped = true;
+      window.saveData = saveWrapped;
+      try { saveData = saveWrapped; } catch(e) {}
+    }
+  } catch(e) {}
+
+  try {
+    if (typeof Location !== 'undefined' && Location.prototype && Location.prototype.reload && !Location.prototype.reload.__monoChatReplyGuarded) {
+      originalReload = Location.prototype.reload;
+      var reloadWrapped = function(){
+        if (inCriticalReplyWindow()) {
+          console.warn('[Mono Hotfix] 已拦截角色回复完成后误触发的整页刷新。');
+          mark(12000);
+          return;
+        }
+        return originalReload.apply(this, arguments);
+      };
+      reloadWrapped.__monoChatReplyGuarded = true;
+      Location.prototype.reload = reloadWrapped;
+    }
+  } catch(e) {}
+
+  // 某些浏览器不允许改 Location.prototype.reload，则改写源代码里的 reload 调用兜底函数。
+  window.monoSafeReload = function(reason){
+    if (inCriticalReplyWindow()) {
+      console.warn('[Mono Hotfix] 阻止刷新：' + (reason || 'chat reply'));
+      mark(12000);
+      return false;
+    }
+    try {
+      if (originalReload) originalReload.call(window.location);
+      else window.location.reload();
+    } catch(e) {}
+    return true;
+  };
+
   document.addEventListener('submit', function(e){
-    if (!chatRootFrom(e.target)) return;
-    e.preventDefault();
-    e.stopPropagation();
+    if (isChatVisible() || inCriticalReplyWindow()) {
+      e.preventDefault();
+      e.stopPropagation();
+      mark(12000);
+      return false;
+    }
   }, true);
 
   document.addEventListener('click', function(e){
-    var btn = null;
-    try { btn = e.target && e.target.closest ? e.target.closest('button') : null; } catch (_) {}
-    if (!btn || !chatRootFrom(btn)) return;
-    if (!btn.hasAttribute('type')) btn.setAttribute('type', 'button');
+    try {
+      var t = e.target && e.target.closest ? e.target.closest('button,input[type="submit"],a,[onclick]') : null;
+      if (!t) return;
+      var txt = (t.textContent || t.value || t.getAttribute('aria-label') || '').trim();
+      var oc = t.getAttribute && String(t.getAttribute('onclick') || '');
+      if (/切换世界|进入「|数据导入|导入|还原主屏幕|重新载入|刷新页面/.test(txt + ' ' + oc)) {
+        window.monoAllowNextIntentionalReload(8000);
+      }
+      if (isChatVisible() && t.tagName === 'BUTTON' && !t.getAttribute('type')) t.setAttribute('type','button');
+    } catch(err) {}
   }, true);
 
-  // 当前聊天页已有按钮一次性修正即可；不要使用全页 MutationObserver。
-  function fixExistingButtons(){
+  // 如果旧逻辑已经把页面跳转排进 setTimeout，beforeunload 最后兜底拦截。
+  window.addEventListener('beforeunload', function(e){
+    if (inCriticalReplyWindow()) {
+      try { e.preventDefault(); } catch(_) {}
+      e.returnValue = '';
+      mark(12000);
+      return '';
+    }
+  }, true);
+
+  // 回复期间生成的按钮全部改为 button，避免回复渲染后表单默认提交造成刷新。
+  function neutralizeChatButtons(root){
     try {
-      document.querySelectorAll('#chatPage button:not([type]),#groupChatPage button:not([type]),#datingChatPage button:not([type]),#callPage button:not([type])')
-        .forEach(function(btn){ btn.setAttribute('type','button'); });
+      if (!root || !root.querySelectorAll) return;
+      root.querySelectorAll('#chatPage button:not([type]), #chatBox button:not([type]), #typingArea button:not([type])').forEach(function(btn){ btn.setAttribute('type','button'); });
     } catch(e) {}
   }
-  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', fixExistingButtons, {once:true});
-  else fixExistingButtons();
+  neutralizeChatButtons(document);
+  try {
+    new MutationObserver(function(muts){
+      if (!isChatVisible() && !inCriticalReplyWindow()) return;
+      muts.forEach(function(m){ (m.addedNodes || []).forEach(function(n){ if (n && n.nodeType === 1) neutralizeChatButtons(n); }); });
+    }).observe(document.documentElement, { childList:true, subtree:true });
+  } catch(e) {}
 
-  console.log('[Mono Fix] lightweight chat submit guard loaded');
+  console.log('[Mono Hotfix] chat reply after-response refresh guard loaded');
 })();
+/* ===== mono-final-stop-refresh-after-ai-reply-stronger-fix ===== */
+(function(){
+  if(window.__monoFinalStopRefreshAfterAiReplyStrongerFix) return;
+  window.__monoFinalStopRefreshAfterAiReplyStrongerFix = true;
 
+  var lockUntil = 0;
+  var lastChatDomSig = '';
+  var originalReload = null;
+  var originalAssign = null;
+  var originalReplace = null;
+
+  function now(){ return Date.now ? Date.now() : new Date().getTime(); }
+  function mark(ms){
+    lockUntil = Math.max(lockUntil, now() + (ms || 30000));
+    try { window.__monoRecentChatActivityAt = now(); } catch(e) {}
+  }
+  function allowIntentional(){
+    try { return !!(window.__monoAllowIntentionalReloadUntil && now() < window.__monoAllowIntentionalReloadUntil); } catch(e){ return false; }
+  }
+  function chatPageIsOpen(){
+    try{
+      var ids=['chatPage','groupChatPage','datingChatPage'];
+      for(var i=0;i<ids.length;i++){
+        var p=document.getElementById(ids[i]);
+        if(!p) continue;
+        var cs=getComputedStyle(p);
+        var visible = cs.display !== 'none' && cs.visibility !== 'hidden' && p.offsetParent !== null;
+        if(visible || p.classList.contains('active') || document.body.classList.contains(ids[i]+'-open')) return true;
+      }
+    }catch(e){}
+    return false;
+  }
+  function inReplySafeWindow(){
+    return !allowIntentional() && (now() < lockUntil || chatPageIsOpen());
+  }
+  function block(reason){
+    if(inReplySafeWindow()){
+      try { console.warn('[Mono Hotfix] 已阻止角色回复后的误刷新：' + (reason || 'unknown')); } catch(e) {}
+      mark(30000);
+      return true;
+    }
+    return false;
+  }
+
+  window.monoMarkChatReplyNoReload = function(ms){ mark(ms || 30000); };
+  window.monoAllowNextIntentionalReload = function(ms){ window.__monoAllowIntentionalReloadUntil = now() + (ms || 8000); };
+
+  // 1) 只要聊天 DOM 出现新消息/头像/语音气泡变化，就认为正处于回复落地阶段，延长禁止刷新窗口。
+  function chatSignature(){
+    try{
+      var nodes=document.querySelectorAll('#chatPage .message, #chatPage .chat-bubble, #chatPage [data-message-id], #chatMessages > *, #messages > *, #chatList > *, .chat-messages > *, #groupChatPage .message, #datingChatPage .message');
+      return String(nodes.length) + ':' + (nodes[nodes.length-1] ? (nodes[nodes.length-1].textContent||'').slice(-80) : '');
+    }catch(e){ return ''; }
+  }
+  function shouldScanChatDom(){
+    return chatPageIsOpen() || now() < lockUntil;
+  }
+  function checkChatDom(){
+    if(!shouldScanChatDom()) return;
+    var sig=chatSignature();
+    if(sig && sig !== lastChatDomSig){
+      lastChatDomSig=sig;
+      if(chatPageIsOpen()) mark(30000);
+    }
+  }
+  setInterval(checkChatDom, 1200);
+  try{
+    new MutationObserver(function(muts){
+      for(var i=0;i<muts.length;i++){
+        var t=muts[i].target;
+        if(t && t.closest && t.closest('#chatPage,#groupChatPage,#datingChatPage,.chat-messages,#chatMessages,#messages,#chatList')){
+          mark(30000); break;
+        }
+      }
+    }).observe(document.documentElement,{childList:true,subtree:true,characterData:true});
+  }catch(e){}
+
+  // 2) 包住常见异步回复函数。很多函数不是挂在 window 上，所以 DOM 监听是主力；这里作为补充。
+  function wrap(name){
+    try{
+      var fn=window[name];
+      if(typeof fn !== 'function' || fn.__monoNoAfterReplyReloadStrong) return;
+      var w=function(){
+        mark(45000);
+        var r;
+        try{ r=fn.apply(this,arguments); }
+        catch(err){ mark(30000); throw err; }
+        if(r && typeof r.then==='function'){
+          return r.then(function(v){ mark(45000); return v; }, function(err){ mark(30000); throw err; });
+        }
+        mark(30000); return r;
+      };
+      w.__monoNoAfterReplyReloadStrong=true;
+      window[name]=w;
+      try{ eval(name+' = w'); }catch(e){}
+    }catch(e){}
+  }
+  ['sendMessage','sendCurrentMessage','sendChat','generateReply','getAIResponse','triggerAuto回复','triggerAutoReply','renderMessages','renderChat','saveData','saveAll','saveWorldData','tryPersonaSendVoice','maybeSendVoice','showNotification','sendBackgroundNotification'].forEach(wrap);
+
+  // 3) 拦截 reload / assign / replace。世界切换、数据导入、还原主屏幕会先放行。
+  try{
+    if(typeof Location !== 'undefined' && Location.prototype){
+      if(Location.prototype.reload && !Location.prototype.reload.__monoStrongGuard){
+        originalReload=Location.prototype.reload;
+        Location.prototype.reload=function(){ if(block('location.reload')) return; return originalReload.apply(this,arguments); };
+        Location.prototype.reload.__monoStrongGuard=true;
+      }
+      if(Location.prototype.assign && !Location.prototype.assign.__monoStrongGuard){
+        originalAssign=Location.prototype.assign;
+        Location.prototype.assign=function(url){ if(block('location.assign')) return; return originalAssign.apply(this,arguments); };
+        Location.prototype.assign.__monoStrongGuard=true;
+      }
+      if(Location.prototype.replace && !Location.prototype.replace.__monoStrongGuard){
+        originalReplace=Location.prototype.replace;
+        Location.prototype.replace=function(url){ if(block('location.replace')) return; return originalReplace.apply(this,arguments); };
+        Location.prototype.replace.__monoStrongGuard=true;
+      }
+    }
+  }catch(e){}
+
+  window.monoSafeReload=function(reason){
+    if(block(reason || 'monoSafeReload')) return false;
+    try{
+      if(originalReload) originalReload.call(window.location);
+      else window.location.reload();
+    }catch(e){}
+    return true;
+  };
+
+  // 4) 回复结束后如果某个旧逻辑设置了 form action / submit，聊天页打开时全部禁止。
+  document.addEventListener('submit',function(e){
+    if(chatPageIsOpen() || now()<lockUntil){
+      e.preventDefault(); e.stopPropagation(); mark(30000); return false;
+    }
+  },true);
+  document.addEventListener('click',function(e){
+    try{
+      var t=e.target && e.target.closest ? e.target.closest('button,a,[onclick],input[type="submit"]') : null;
+      if(!t) return;
+      var s=((t.textContent||'')+' '+(t.value||'')+' '+(t.getAttribute('onclick')||'')).trim();
+      if(/切换世界|进入「|数据导入|导入|还原主屏幕|刷新页面|重新载入/.test(s)) window.monoAllowNextIntentionalReload(10000);
+      if(chatPageIsOpen() && t.tagName==='BUTTON' && !t.getAttribute('type')) t.setAttribute('type','button');
+    }catch(err){}
+  },true);
+
+  try{ checkChatDom(); }catch(e){}
+  console.log('[Mono Hotfix] stronger stop-refresh-after-AI-reply loaded');
+})();
 /* ===== mono-strict-secondary-api-persistence-v2 ===== */
 /* MONO HOTFIX 2026-06-24 v2: 副 API 重新进入后不再被初始化逻辑覆盖成默认 API。
    重点：保存/切换副 API 时写入稳定备份；启动时如果发现默认 API 是误覆盖，会恢复最后使用的副 API。 */
@@ -141415,6 +141699,88 @@ body.chat-page-active #chatPage .chat-input-textarea,
 })();
 </script>
 
+
+<script id="mono-chat-reply-crash-final-fix-20260714">
+(function(){
+  'use strict';
+  if (window.__monoChatReplyCrashFinalFix20260714) return;
+  window.__monoChatReplyCrashFinalFix20260714 = true;
+
+  function chatRootVisible(){
+    var p=document.getElementById('chatPage');
+    if(!p) return false;
+    try{
+      var cs=getComputedStyle(p);
+      return p.classList.contains('active') || (!p.classList.contains('hidden') && cs.display!=='none' && cs.visibility!=='hidden');
+    }catch(e){ return !p.classList.contains('hidden'); }
+  }
+  function fixButtons(root){
+    try{
+      (root||document).querySelectorAll('#chatPage button:not([type]),#chatBox button:not([type]),#typingArea button:not([type]),#inputBar button:not([type]),.chat-footer button:not([type])').forEach(function(b){b.type='button';});
+    }catch(e){}
+  }
+  fixButtons(document);
+  document.addEventListener('submit',function(e){
+    try{
+      if(chatRootVisible() || (e.target && e.target.closest && e.target.closest('#chatPage,#chatBox,#typingArea,#inputBar,.chat-footer'))){
+        e.preventDefault();
+        e.stopPropagation();
+        if(e.stopImmediatePropagation)e.stopImmediatePropagation();
+        return false;
+      }
+    }catch(_){}
+  },true);
+  document.addEventListener('keydown',function(e){
+    if(e.key!=='Enter') return;
+    var t=e.target;
+    if(!t || t.id!=='userInput') return;
+    // Enter 的发送只交给原聊天监听器，不允许浏览器把它当作 form submit。
+    if(e.ctrlKey || e.metaKey || e.altKey) return;
+    try{
+      var form=t.closest('form');
+      if(form) form.setAttribute('onsubmit','return false');
+    }catch(_){}
+  },true);
+  try{
+    new MutationObserver(function(records){
+      records.forEach(function(r){
+        Array.prototype.forEach.call(r.addedNodes||[],function(n){if(n&&n.nodeType===1)fixButtons(n);});
+      });
+    }).observe(document.documentElement,{childList:true,subtree:true});
+  }catch(e){}
+
+  // 避免回复完成后多个功能同时重复全量重绘同一个聊天室。
+  try{
+    if(typeof window.renderMessages==='function' && !window.renderMessages.__monoReplyRafCoalesced){
+      var originalRender=window.renderMessages;
+      var queued=false,lastArgs=null,lastThis=null;
+      var wrapped=function(){
+        lastArgs=arguments; lastThis=this;
+        if(queued) return;
+        queued=true;
+        requestAnimationFrame(function(){
+          queued=false;
+          try{ originalRender.apply(lastThis,lastArgs||[]); }
+          catch(err){ console.error('[Mono] 聊天渲染失败，已阻止整页崩溃：',err); }
+          lastArgs=lastThis=null;
+        });
+      };
+      wrapped.__monoReplyRafCoalesced=true;
+      window.renderMessages=wrapped;
+      try{renderMessages=wrapped;}catch(e){}
+    }
+  }catch(e){}
+
+  window.addEventListener('error',function(e){
+    // 聊天回复阶段出现单个组件错误时，不再让错误继续破坏整个页面布局。
+    if(chatRootVisible()){
+      try{ document.documentElement.classList.remove('mono-app-booting'); }catch(_){}
+      try{ fixButtons(document); }catch(_){}
+    }
+  },true);
+  console.log('[Mono] chat reply crash final fix loaded');
+})();
+</script>
 </body>
 
 <script id="mono-youtube-search-tags-duration-final-fix">
